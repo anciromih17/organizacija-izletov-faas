@@ -506,3 +506,4 @@ Projekt uspešno demonstrira uporabo:
 
 Sistem je modularen, skalabilen in primeren za obdelavo asinhronih dogodkov brez potrebe po upravljanju strežniške infrastrukture.
 
+- ko zaženem: firebase emulators:start --import=./emulator-data --export-on-exit
