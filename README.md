@@ -1,8 +1,4 @@
 # Izletko – Brezstrežniški sistem za organizacijo izletov
-
-> **Naloga 9 + 10 | ITA | Magistrski študij**  
-> Brezstrežniški zaledni sistem (FaaS) + React spletni vmesnik
-
 ---
 
 ## Kazalo
