@@ -1,0 +1,15 @@
+{
+  "short_name": "Izletko",
+  "name": "Izletko – Organizacija izletov",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#d4a574",
+  "background_color": "#0e0d0b"
+}
