@@ -26,7 +26,7 @@ Sistem je zgrajen na principu **event-driven FaaS arhitekture**: funkcije se ne 
 
 ---
 
-## 2. Tehnološki sklad
+## 2. Tehnologije
 
 | Tehnologija | Vloga v projektu |
 |---|---|
