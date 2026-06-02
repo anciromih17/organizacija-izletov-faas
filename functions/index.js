@@ -7,15 +7,60 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 const { PubSub } = require("@google-cloud/pubsub");
 const { onObjectFinalized } = require("firebase-functions/v2/storage");
+const nodemailer = require("nodemailer");
 
 admin.initializeApp();
 const db = admin.firestore();
 const pubsub = new PubSub({ projectId: "organizacija-izletov" });
 const TRIP_EVENTS_TOPIC = "trip-events";
 
+// Email pomožna funkcija (Ethereal za testiranje) 
+async function sendRegistrationEmail({ to, travelerName, tripName, registrationId }) {
+    const testAccount = await nodemailer.createTestAccount();
+
+    const transporter = nodemailer.createTransport({
+        host: "smtp.ethereal.email",
+        port: 587,
+        secure: false,
+        auth: {
+            user: testAccount.user,
+            pass: testAccount.pass,
+        },
+    });
+
+    const info = await transporter.sendMail({
+        from: '"Organizacija izletov" <noreply@izleti.si>',
+        to,
+        subject: `Potrditev prijave – ${tripName}`,
+        html: `
+            <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px;background:#f9f9f7;border-radius:12px;">
+                <h2 style="color:#1a1a1a;margin-bottom:8px;">Vaša prijava je bila sprejeta ✓</h2>
+                <p style="color:#555;margin-bottom:24px;">Pozdravljeni, ${travelerName}!</p>
+                <p style="color:#555;">Uspešno ste se prijavili na izlet <strong>${tripName}</strong>.</p>
+                <div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:16px;margin:24px 0;">
+                    <p style="margin:0;color:#888;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">ID prijave</p>
+                    <p style="margin:4px 0 0;color:#1a1a1a;font-family:monospace;font-size:14px;">${registrationId}</p>
+                </div>
+                <p style="color:#555;">Naslednji korak: v sistemu naložite zahtevane dokumente.</p>
+                <p style="color:#aaa;font-size:12px;margin-top:32px;">© Izleti — avtomatsko sporočilo, ne odgovarjajte</p>
+            </div>
+        `,
+    });
+
+    // Izpis v ui
+    logger.info("Email poslan <i>(preview)</i>:", {
+        to,
+        tripName,
+        registrationId,
+        previewUrl: nodemailer.getTestMessageUrl(info),
+    });
+
+    return nodemailer.getTestMessageUrl(info);
+}
+
 setGlobalOptions({ maxInstances: 10 });
 
-// 1. Health check funkcija
+// Health check funkcija
 exports.healthCheck = onRequest((req, res) => {
     res.status(200).json({
         system: "organizacija-izletov",
@@ -24,7 +69,7 @@ exports.healthCheck = onRequest((req, res) => {
     });
 });
 
-// 2. Nastavitev uporabniške vloge
+// User event - nastavitev uporabniške vloge
 exports.setUserRole = onRequest(async (req, res) => {
     try {
         const { email, role } = req.body;
@@ -67,9 +112,9 @@ exports.setUserRole = onRequest(async (req, res) => {
     }
 });
 
-// 3. Zavarovana callable funkcija - prijava na izlet
+// User event - prijava na izlet
 exports.createTripRegistration = onCall(async (request) => {
-    if (!request.auth) {
+    if (!request.auth) { // AVTENTIKACIJA
         throw new HttpsError("unauthenticated", "Uporabnik mora biti prijavljen.");
     }
 
@@ -91,13 +136,31 @@ exports.createTripRegistration = onCall(async (request) => {
 
     const docRef = await db.collection("tripRegistrations").add(registration);
 
+    // Objavi na Pub/Sub - sproži pošiljanje emaila
+    try {
+        const topic = await ensureTopicExists(TRIP_EVENTS_TOPIC);
+        await topic.publishMessage({
+            json: {
+                eventType: "REGISTRATION_CONFIRMED",
+                registrationId: docRef.id,
+                email,
+                travelerName,
+                tripName,
+                createdAt: new Date().toISOString(),
+            },
+        });
+        logger.info("Pub/Sub sporočilo objavljeno za novo prijavo:", docRef.id);
+    } catch (pubsubError) {
+        logger.warn("Pub/Sub objava ni uspela:", pubsubError.message);
+    }
+
     return {
         message: "Prijava na izlet je bila uspešno oddana.",
         registrationId: docRef.id,
     };
 });
 
-// 4. Firestore trigger - nova prijava
+// Firestore trigger - nova prijava
 exports.onTripRegistrationCreated = onDocumentCreated(
     "tripRegistrations/{registrationId}",
     async (event) => {
@@ -114,13 +177,14 @@ exports.onTripRegistrationCreated = onDocumentCreated(
             type: "NEW_REGISTRATION",
             message: `Nova prijava: ${data.travelerName} za izlet ${data.tripName}`,
             registrationId: event.params.registrationId,
+            userId: data.userId || null,
             createdAt: new Date(),
             read: false,
         });
     }
 );
 
-// 5. Firestore trigger - sprememba statusa prijave
+// Firestore trigger - sprememba statusa prijave
 exports.onTripRegistrationUpdated = onDocumentUpdated(
     "tripRegistrations/{registrationId}",
     async (event) => {
@@ -139,15 +203,16 @@ exports.onTripRegistrationUpdated = onDocumentUpdated(
 
         await db.collection("notifications").add({
             type: "STATUS_CHANGED",
-            message: `Status prijave za ${after.travelerName} je spremenjen iz ${before.status} v ${after.status}.`,
+            message: `Status vaše prijave za izlet ${after.tripName} je spremenjen iz "${before.status}" v "${after.status}".`,
             registrationId: event.params.registrationId,
+            userId: after.userId || null,
             createdAt: new Date(),
             read: false,
         });
     }
 );
 
-// Testna funkcija za prijavo (generiranje custom tokena)
+// User event - funkcija za prijavo (generiranje custom tokena)
 exports.testLogin = onRequest(async (req, res) => {
     try {
         const email = req.query.email || req.body.email;
@@ -175,13 +240,13 @@ exports.testLogin = onRequest(async (req, res) => {
     }
 });
 
-// Pomožna funkcija za preverjanje uporabniške vloge
+// AVTENTIKCIJA - Pomožna funkcija za preverjanje uporabniške vloge
 function requireRole(request, allowedRoles) {
-    if (!request.auth) {
+    if (!request.auth) { // AVTENTIKACIJA
         throw new HttpsError("unauthenticated", "Uporabnik mora biti prijavljen.");
     }
 
-    const role = request.auth.token.role;
+    const role = request.auth.token.role; // AVTORIZACIJA - preverjanje vloge iz custom claimsa
 
     if (!allowedRoles.includes(role)) {
         throw new HttpsError(
@@ -193,7 +258,7 @@ function requireRole(request, allowedRoles) {
     return role;
 }
 
-// 6. Admin potrdi ali zavrne prijavo
+// User event - Admin potrdi ali zavrne prijavo
 exports.processTripRegistrationSecure = onCall(async (request) => {
     requireRole(request, ["admin"]);
 
@@ -240,11 +305,12 @@ async function checkMissingDocuments() {
     for (const doc of snapshot.docs) {
         const registration = doc.data();
 
-        if (registration.documentsUploaded !== true) {
+        if (registration.documentsUploaded !== true && registration.status !== "cancelled" && registration.status !== "rejected") {
             await db.collection("notifications").add({
                 type: "MISSING_DOCUMENTS",
-                message: `Potnik ${registration.travelerName} za izlet ${registration.tripName} še nima naloženih dokumentov.`,
+                message: `Za izlet "${registration.tripName}" še niste naložili zahtevanih dokumentov.`,
                 registrationId: doc.id,
+                userId: registration.userId || null,
                 createdAt: new Date(),
                 read: false,
             });
@@ -256,7 +322,7 @@ async function checkMissingDocuments() {
     return remindersCreated;
 }
 
-// 7. Scheduled funkcija - dnevni opomnik za manjkajoče dokumente
+// Scheduled funkcija - dnevni opomnik za manjkajoče dokumente
 exports.dailyMissingDocumentsReminder = onSchedule(
     "every day 08:00",
     async () => {
@@ -268,7 +334,7 @@ exports.dailyMissingDocumentsReminder = onSchedule(
     }
 );
 
-// 8. HTTP test scheduled logike - ročni sprožilec dnevnega preverjanja
+// HTTP test scheduled logike - ročni sprožilec dnevnega preverjanja
 exports.runDailyReminderCheckNow = onRequest(async (req, res) => {
     try {
         const remindersCreated = await checkMissingDocuments();
@@ -298,7 +364,7 @@ async function ensureTopicExists(topicName) {
     return topic;
 }
 
-// 9. HTTP objava Pub/Sub sporočila
+// HTTP objava Pub/Sub sporočila
 exports.publishTripEvent = onRequest(async (req, res) => {
     try {
         const { registrationId, eventType } = req.body;
@@ -332,7 +398,7 @@ exports.publishTripEvent = onRequest(async (req, res) => {
     }
 });
 
-// 10. Pub/Sub trigger - obdela sporočilo iz vrste
+// Pub/Sub trigger - obdela sporočilo iz vrste
 exports.onTripEventPublished = onMessagePublished(
     TRIP_EVENTS_TOPIC,
     async (event) => {
@@ -340,6 +406,7 @@ exports.onTripEventPublished = onMessagePublished(
 
         logger.info("Prejeto Pub/Sub sporočilo:", messageData);
 
+        // Zapiši v event log
         await db.collection("eventLogs").add({
             source: "PUBSUB",
             eventType: messageData.eventType,
@@ -348,17 +415,44 @@ exports.onTripEventPublished = onMessagePublished(
             processed: true,
         });
 
-        await db.collection("notifications").add({
-            type: "PUBSUB_EVENT_PROCESSED",
-            message: `Obdelan Pub/Sub dogodek: ${messageData.eventType}`,
-            registrationId: messageData.registrationId,
-            createdAt: new Date(),
-            read: false,
-        });
+        // Pošlji email ob potrditvi prijave
+        if (messageData.eventType === "REGISTRATION_CONFIRMED") {
+            let previewUrl = null;
+
+            try {
+                previewUrl = await sendRegistrationEmail({
+                    to: messageData.email,
+                    travelerName: messageData.travelerName,
+                    tripName: messageData.tripName,
+                    registrationId: messageData.registrationId,
+                });
+            } catch (emailError) {
+                logger.error("Pošiljanje emaila ni uspelo:", emailError.message);
+            }
+
+            await db.collection("notifications").add({
+                type: "EMAIL_SENT",
+                message: `Potrditveni email je bil poslan na ${messageData.email} za izlet "${messageData.tripName}".${previewUrl ? ` Preview: ${previewUrl}` : ""}`,
+                registrationId: messageData.registrationId,
+                userId: messageData.userId || null,
+                previewUrl: previewUrl || null,
+                createdAt: new Date(),
+                read: false,
+            });
+        } else {
+            // Za vse ostale event tipe – splošno obvestilo
+            await db.collection("notifications").add({
+                type: "PUBSUB_EVENT_PROCESSED",
+                message: `Obdelan Pub/Sub dogodek: ${messageData.eventType}`,
+                registrationId: messageData.registrationId,
+                createdAt: new Date(),
+                read: false,
+            });
+        }
     }
 );
 
-// 11. Storage trigger ob nalaganju datoteke v Storage - ustvari zapis in posodobi prijavo
+// Storage trigger ob nalaganju datoteke v Storage - ustvari zapis in posodobi prijavo
 exports.onTripDocumentUploaded = onObjectFinalized(async (event) => {
     const file = event.data;
 
@@ -401,8 +495,9 @@ exports.onTripDocumentUploaded = onObjectFinalized(async (event) => {
 
     await db.collection("notifications").add({
         type: "STORAGE_DOCUMENT_UPLOADED",
-        message: `V Storage je bil naložen dokument ${fileName} za prijavo ${registrationId}.`,
+        message: `Dokument "${fileName}" je bil uspešno naložen za izlet.`,
         registrationId,
+        userId: registrationDoc.data().userId || null,
         documentId: docRef.id,
         createdAt: new Date(),
         read: false,
